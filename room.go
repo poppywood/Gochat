@@ -2,6 +2,8 @@ package main
 
 import (
 	"github.com/gorilla/websocket"
+	"github.com/poppywood/Gotrace"
+	"github.com/stretchr/objx"
 	"log"
 	"net/http"
 )
@@ -9,13 +11,16 @@ import (
 type room struct {
 	// forward is a channel that holds incoming messages
 	// that should be forwarded to the other clients.
-	forward chan []byte
+	forward chan *message
 	// join is a channel for clients wishing to join the room.
 	join chan *client
 	// leave is a channel for clients wishing to leave the room.
 	leave chan *client
 	// clients holds all current clients in this room.
 	clients map[*client]bool
+	// tracer will receive trace information of activity
+	// in the room.
+	tracer trace.Tracer
 }
 
 func (r *room) run() {
@@ -25,21 +30,18 @@ func (r *room) run() {
 		case client := <-r.join:
 			// joining
 			r.clients[client] = true
+			r.tracer.Trace("New client joined")
 		case client := <-r.leave:
 			// leaving
 			delete(r.clients, client)
 			close(client.send)
+			r.tracer.Trace("Client left")
 		case msg := <-r.forward:
 			// forward message to all clients
+			r.tracer.Trace("Message received: ", string(msg.Message))
 			for client := range r.clients {
-				select {
-				case client.send <- msg:
-					// send the message
-				default:
-					// failed to send
-					delete(r.clients, client)
-					close(client.send)
-				}
+				client.send <- msg
+				r.tracer.Trace(" -- sent to client")
 			}
 		}
 	}
@@ -60,12 +62,18 @@ func (r *room) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		log.Fatal("ServeHTTP:", err)
 		return
 	}
+	authCookie, err := req.Cookie("auth")
+	if err != nil {
+		log.Fatal("Failed to get auth cookie:", err)
+		return
+	}
 	// when a request comes in via the ServeHTTP method, we get the socket by calling the upgrader.Upgrade method.
 	// All being well, we then create our client and pass it into the join channel for the current room.
 	client := &client{
 		socket: socket,
-		send:   make(chan []byte, messageBufferSize),
+		send:     make(chan *message, messageBufferSize),
 		room:   r,
+		userData: objx.MustFromBase64(authCookie.Value),
 	}
 	r.join <- client
 	defer func() { r.leave <- client }()
@@ -81,9 +89,10 @@ func (r *room) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // newRoom makes a new room that is ready to go.
 func newRoom() *room {
 	return &room{
-		forward: make(chan []byte),
+		forward: make(chan *message),
 		join:    make(chan *client),
 		leave:   make(chan *client),
 		clients: make(map[*client]bool),
+		//tracer:  trace.Off(), //remove to enable tracing
 	}
 }
